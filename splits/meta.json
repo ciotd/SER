@@ -1,0 +1,24 @@
+{
+  "dataset_root": "E:\\03_datasets\\datasets_aihub_actor",
+  "seed": 42,
+  "label_map": {
+    "기쁨": 0,
+    "분노": 1,
+    "불안": 2,
+    "슬픔": 3,
+    "중립": 4
+  },
+  "emotions": [
+    "기쁨",
+    "분노",
+    "불안",
+    "슬픔",
+    "중립"
+  ],
+  "hash": "79a2b4e17e7228cd69a9451eedb8fd1f086f078b2a02c02f884d0a4bd96e8766",
+  "counts": {
+    "train": 260819,
+    "val": 32602,
+    "test": 32603
+  }
+}
