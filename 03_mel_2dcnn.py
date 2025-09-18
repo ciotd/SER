@@ -15,9 +15,7 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support, classification_report
 
 
-# ============================
 # 모델
-# ============================
 class Emotion_2DCNN(nn.Module):
     def __init__(self, num_classes=5, input_shape=(1, 257, 301)):
         super().__init__()
@@ -49,9 +47,7 @@ class Emotion_2DCNN(nn.Module):
         return x
 
 
-# ============================
 # Dataset
-# ============================
 class EmotionDataset(Dataset):
     def __init__(self, file_paths, labels,
                  sr=16000, duration=3, n_fft=512, hop_length=160, win_length=400, n_mels=128):
@@ -88,9 +84,7 @@ class EmotionDataset(Dataset):
         return spec_tensor, label_tensor
 
 
-# ============================
 # Split 고정 함수
-# ============================
 def _scan_dataset(root_dir):
     root = Path(root_dir)
     emotions = sorted([d.name for d in root.iterdir() if d.is_dir()])
@@ -186,10 +180,9 @@ def prepare_dataloaders_from_csv(split_dir, batch_size=32, n_mels=128):
     num_classes = len(set(pd.concat([tr["label_id"], va["label_id"], te["label_id"]]).astype(int).tolist()))
     return train_loader, val_loader, test_loader, label_map, id2label, num_classes
 
-# ============================
+
 # Train & Evaluate
-# ============================
-def Train_model(model, train_loader, val_loader, num_epochs=10, lr=1e-3,
+def Train_model(model, train_loader, val_loader, num_epochs=5, lr=1e-3,
                 device="cuda", save_path="./model/best_model_mel_2dcnn.pth"):
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -304,15 +297,14 @@ def estimate_time_frames(sr=16000, duration=3, n_fft=512, hop_length=160, win_le
     )
     return mel.shape[1]  # time frames
 
-# ============================
+
 # Main
-# ============================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", type=str, choices=["train", "test"], required=True)
     parser.add_argument("--dataset", type=str, default="storage1/SER/datasets_aihub_actor")
     parser.add_argument("--checkpoint", type=str, default="./model/best_model_mel_2dcnn.pth")
-    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch_size", type=int, default=64)
 
     # CSV split 디렉터리

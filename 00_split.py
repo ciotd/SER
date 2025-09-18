@@ -14,7 +14,7 @@ def scan_dataset(dataset):
             rows.append({"filepath": os.path.abspath(f), "label":emo, "label_id": label_map[emo]})
     return pd.DataFrame(rows), label_map, emotions
     
-def hash_inputs(df, seed): # 이거 해시테이블은 진짜 뭔지 모르겠음ㅠㅠㅠ 왜 필요한거야..
+def hash_inputs(df, seed): # 데이터프레임과 시드를 해싱
     h = hashlib.sha256()
     for _, r in df.iterrows():
         h.update(r["filepath"].encode()); h.update(str(r["label_id"]).encode())

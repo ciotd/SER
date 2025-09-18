@@ -13,7 +13,6 @@ import torchvision.models as models
 from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import classification_report, confusion_matrix
 
-# Model
 class EmotionRESNET(nn.Module):
     def __init__(self, num_classes=5):
         super().__init__()
@@ -26,11 +25,9 @@ class EmotionRESNET(nn.Module):
     def forward(self, x):
         return self.model(x)
 
-
-# Dataset
 class EmotionDataset(Dataset):
     def __init__(self, file_paths, labels,
-                 sr=16000, duration=3, n_fft=512, hop_length=160, win_length=400):
+                 sr=16000, duration=3, n_fft=512, hop_length=160, win_length=400, n_mels=64, n_mfcc=40):
         self.file_paths = file_paths
         self.labels = labels
         self.sr = sr
@@ -39,9 +36,19 @@ class EmotionDataset(Dataset):
         self.hop_length = hop_length
         self.win_length = win_length
         self.max_len = sr * duration
+        self.n_mels = n_mels
+        self.n_mfcc = n_mfcc
 
     def __len__(self):
         return len(self.file_paths)
+
+    @staticmethod
+    def _minmax_to_pm1(A: np.ndarray) -> np.ndarray:
+        mn, mx = float(A.min()), float(A.max())
+        if mx - mn < 1e-8:
+            return np.zeros_like(A, dtype=np.float32)
+        A = (A - mn) / (mx - mn + 1e-8)
+        return (2.0 * A - 1.0).astype(np.float32)
 
     def __getitem__(self, index):
         fp = self.file_paths[index]
@@ -53,29 +60,28 @@ class EmotionDataset(Dataset):
         else:
             y = y[:self.max_len]
 
-        # Mel-spectrogram
+        # MFCC (Mel -> dB -> DCT)
         M = librosa.feature.melspectrogram(
             y=y, sr=self.sr, n_fft=self.n_fft,
             hop_length=self.hop_length, win_length=self.win_length,
-            n_mels=64, power=2.0
+            n_mels=self.n_mels, center=True, power=2.0
+        )
+        M_db = librosa.power_to_db(M, ref=np.max)
+        
+        # MFCC-dct
+        MFCC = librosa.feature.mfcc(
+            S=M_db, sr=self.sr, n_mfcc=self.n_mfcc, dct_type=2, lifter=0
         )
 
-        M_db = librosa.power_to_db(M, ref=np.max)
-
-        # normalize to [-1,1]
-        mn, mx = M_db.min(), M_db.max()
-        M_db = (M_db - mn) / (mx - mn + 1e-8)
-        M_db = 2 * M_db - 1
-
-        x = torch.tensor(M_db, dtype=torch.float32).unsqueeze(0)
+        A = self._minmax_to_pm1(MFCC)        # [-1, 1] 정규화
+        x = torch.tensor(A, dtype=torch.float32).unsqueeze(0)  # (1, n_mfcc, T)
         y_lbl = torch.tensor(self.labels[index], dtype=torch.long)
-        
         return x, y_lbl
 
 
 # CSV DataLoaders
 def prepare_dataloaders_from_csv(
-    split_dir, batch_size=32, sr=16000, duration=3, n_fft=512, hop_length=160, win_length=400
+    split_dir, batch_size=32, sr=16000, duration=3, n_fft=512, hop_length=160, win_length=400, n_mels=64, n_mfcc=40
 ):
     split_dir = Path(split_dir)
     tr = pd.read_csv(split_dir / "train.csv")
@@ -101,7 +107,7 @@ def prepare_dataloaders_from_csv(
         paths = df["filepath"].astype(str).tolist()
         labels = df["label_id"].astype(int).tolist()
         return EmotionDataset(paths, labels, sr=sr, duration=duration,
-                              n_fft=n_fft, hop_length=hop_length, win_length=win_length)
+                              n_fft=n_fft, hop_length=hop_length, win_length=win_length, n_mels=n_mels, n_mfcc=n_mfcc)
 
     train_ds = df_to_ds(tr)
     val_ds   = df_to_ds(va)
@@ -121,10 +127,9 @@ def prepare_dataloaders_from_csv(
 
     return train_loader, val_loader, test_loader, num_classes, class_names
 
-
 # Train / Eval
 def Train_model(model, train_loader, val_loader, num_epochs=5, lr=1e-3,
-                device="cuda", save_path="./model/best_model_mel_resnet.pth"):
+                device="cuda", save_path="./model/best_model_mfcc_resnet.pth"):
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
@@ -198,23 +203,27 @@ def evaluate_model(model, test_loader, device="cuda", class_names=None):
     print("Confusion Matrix:")
     print(confusion_matrix(all_labels, all_preds))
 
+
 # Main
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", type=str, choices=["train", "test"], required=True)
     ap.add_argument("--split_dir", type=str, default="./dataset", help="train/val/test CSV 위치")
-    ap.add_argument("--checkpoint", type=str, default="./model/best_model_mel_resnet.pth")
+    ap.add_argument("--checkpoint", type=str, default="./model/best_model_mfcc_resnet.pth")
     ap.add_argument("--epochs", type=int, default=5)
     ap.add_argument("--batch_size", type=int, default=64)
     ap.add_argument("--gpu", type=int, default=0)
 
 
-    # STFT params
+    # MFCC params
     ap.add_argument("--sr", type=int, default=16000)
     ap.add_argument("--duration", type=int, default=3)
     ap.add_argument("--n_fft", type=int, default=512)
     ap.add_argument("--hop_length", type=int, default=160)
     ap.add_argument("--win_length", type=int, default=400)
+    ap.add_argument("--n_mels", type=int, default=64)
+    ap.add_argument("--n_mfcc", type=int, default=40)
+
 
     args = ap.parse_args()
     device = f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu"

@@ -1,40 +1,37 @@
 import argparse
 import os
-from tqdm import tqdm
-import glob
-import librosa
+from pathlib import Path
+import json
+import pandas as pd
 import numpy as np
+import librosa
+from tqdm import tqdm
 
 import torch
 import torch.nn as nn
 import torchvision.models as models
-
-# scikitlearn 라이브러리에서 데이터 분할 해주는 함수
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report, confusion_matrix
 from torch.utils.data import Dataset, DataLoader
+from sklearn.metrics import classification_report, confusion_matrix
 
-# 2D CNN 딥러닝 모델 네트워크 -> 간단하게 직접 만들어 본 것.
+
+# Model
 class EmotionRESNET(nn.Module):
     def __init__(self, num_classes=5):
         super().__init__()
-
-        #ResNet18 불러오기(사전학습 가중치는 X)
-        self.model = models.resnet18(weights=None)
-
-        # 1채널 입력 스펙트로그램을 받을 수 있게 변경한 것. 원래는 3채널이 들어오게 되어있대
-        self.model.conv1 = nn.Conv2d(1,64, kernel_size=7, stride=2, padding=3, bias=False)
-
-        # 출력 차원을 우리가 풀려는 5개의 크래스에 맞게 바꾼 것.
+        self.model = models.resnet18(weights=None)  # no pretrained
+        # 1-ch spectrogram
+        self.model.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
         in_features = self.model.fc.in_features
         self.model.fc = nn.Linear(in_features, num_classes)
 
-    def forward(self,x):
+    def forward(self, x):
         return self.model(x)
 
-# EmotionDataset -> 데이터셋 정의
+
+# Dataset
 class EmotionDataset(Dataset):
-    def __init__(self, file_paths, labels, sr=16000, duration=3, n_fft=512, hop_length=160, win_length=400):
+    def __init__(self, file_paths, labels,
+                 sr=16000, duration=3, n_fft=512, hop_length=160, win_length=400):
         self.file_paths = file_paths
         self.labels = labels
         self.sr = sr
@@ -42,70 +39,90 @@ class EmotionDataset(Dataset):
         self.n_fft = n_fft
         self.hop_length = hop_length
         self.win_length = win_length
-        self.max_len = sr * duration # 고정 길이를 준다 3초 동안...
-    
+        self.max_len = sr * duration
+
     def __len__(self):
-        return len(self.file_paths) # 데이터셋 샘플 갯수가 반환됨.
-    
+        return len(self.file_paths)
+
     def __getitem__(self, index):
-        file_path = self.file_paths[index]
-        label = self.labels[index]
+        fp = self.file_paths[index]
+        y, _ = librosa.load(fp, sr=self.sr)
 
-        # 1) 오디오 로드
-        y, sr = librosa.load(file_path, sr=self.sr)
-
-        # 2) 패딩/클리핑 (고정 길이 3초)
+        # pad/clip 3s
         if len(y) < self.max_len:
-            y = np.pad(y, (0, self.max_len - len(y))) # 길이가 작으면 그 뒤로 다 0으로 채운다 이 말이잖아.
+            y = np.pad(y, (0, self.max_len - len(y)))
         else:
-            y = y[:self.max_len] # 길이가 3초 분량보다 더 길면 그냥 3초 분량까지만 자른다는 거고.
+            y = y[:self.max_len]
 
-        # 3) STFT -> magnitude -> dB
-        stft = librosa.stft(y, n_fft=self.n_fft, hop_length=self.hop_length, win_length=self.win_length)
-        spec = np.abs(stft)
+        # STFT -> |.| -> dB
+        spec = np.abs(librosa.stft(
+            y, n_fft=self.n_fft, hop_length=self.hop_length,
+            win_length=self.win_length, center=True
+        ))
         spec_db = librosa.amplitude_to_db(spec, ref=np.max)
 
-        # 4) Normalize [-1,1]
-        spec_db = (spec_db - spec_db.min()) / (spec_db.max() - spec_db.min())
-        spec_db = 2*spec_db -1
+        # normalize to [-1, 1]
+        mn, mx = spec_db.min(), spec_db.max()
+        spec_db = (spec_db - mn) / (mx - mn + 1e-8)
+        spec_db = 2 * spec_db - 1
 
-        # 5) Tensor 변환 (채널 1개 추가해야 함) 
-        # # -> 여기서 spec 이미지랑 라벨 따로 만드는 건 나도 아직 이해 못함.
-        spec_tensor = torch.tensor(spec_db, dtype=torch.float32).unsqueeze(0)
-        label_tensor = torch.tensor(label, dtype=torch.long)
-
-        return spec_tensor, label_tensor
-
-# 데이터 준비 함수
-def prepare_dataloaders(root_dir, test_size=0.2, val_size=0.1, batch_size=32):
-    emotions = sorted(os.listdir(root_dir)) # 기쁨, 슬픔, 분노, etc 감정 카테고리 별로 디렉토리가 정리되어 있음
-    file_paths, labels = [], []
-    label_map = {emo: idx for idx, emo in enumerate(emotions)}
-
-    # 디렉토리 명으로 데이터-라벨 리스트 만들기
-    for emo in tqdm(emotions):
-        files = glob.glob(os.path.join(root_dir, emo, "*.wav"))
-        for f in files:
-            file_paths.append(f)
-            labels.append(label_map[emo])
-        
-    # train/val/test split (고정 seed=42)
-    train_files, test_files, train_labels, test_labels = train_test_split(file_paths, labels, test_size=test_size, random_state=42, stratify=labels)
-    train_files, val_files, train_labels, val_labels = train_test_split(train_files, train_labels, test_size=val_size, random_state=42, stratify=train_labels)
-
-    train_dataset = EmotionDataset(train_files, train_labels)
-    val_dataset = EmotionDataset(val_files, val_labels)
-    test_dataset = EmotionDataset(test_files, test_labels)
-
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-
-    return train_loader, val_loader, test_loader
+        x = torch.tensor(spec_db, dtype=torch.float32).unsqueeze(0)
+        y_lbl = torch.tensor(self.labels[index], dtype=torch.long)
+        return x, y_lbl
 
 
-# 학습 함수
-def Train_model(model, train_loader, val_loader, num_epochs=10, lr=1e-3, device="cuda", save_path="./model/best_model_stft_resnet.pth"):
+# CSV DataLoaders
+def prepare_dataloaders_from_csv(
+    split_dir, batch_size=32, sr=16000, duration=3, n_fft=512, hop_length=160, win_length=400
+):
+    split_dir = Path(split_dir)
+    tr = pd.read_csv(split_dir / "train.csv")
+    va = pd.read_csv(split_dir / "val.csv")
+    te = pd.read_csv(split_dir / "test.csv")
+
+    # label_map / id2label
+    id2label = None
+    meta_path = split_dir / "meta.json"
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            lm = meta.get("label_map")
+            if lm:
+                id2label = {int(v): k for k, v in lm.items()}
+        except Exception:
+            pass
+    if id2label is None and "label" in tr.columns and "label_id" in tr.columns:
+        pairs = pd.concat([tr, va, te])[["label", "label_id"]].drop_duplicates()
+        id2label = {int(r["label_id"]): r["label"] for _, r in pairs.iterrows()}
+
+    def df_to_ds(df):
+        paths = df["filepath"].astype(str).tolist()
+        labels = df["label_id"].astype(int).tolist()
+        return EmotionDataset(paths, labels, sr=sr, duration=duration,
+                              n_fft=n_fft, hop_length=hop_length, win_length=win_length)
+
+    train_ds = df_to_ds(tr)
+    val_ds   = df_to_ds(va)
+    test_ds  = df_to_ds(te)
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False)
+    test_loader  = DataLoader(test_ds,  batch_size=batch_size, shuffle=False)
+
+    num_classes = len(set(pd.concat([tr["label_id"], va["label_id"], te["label_id"]]).astype(int)))
+    # class_names: 0..N-1 기준 정렬. id2label 없으면 문자열로 대체.
+    if id2label is None:
+        class_names = [str(i) for i in range(num_classes)]
+    else:
+        # 보장: 0..N-1 모두 존재한다고 가정. 누락 시 문자열로 대체.
+        class_names = [id2label.get(i, str(i)) for i in range(num_classes)]
+
+    return train_loader, val_loader, test_loader, num_classes, class_names
+
+
+# Train / Eval
+def Train_model(model, train_loader, val_loader, num_epochs=5, lr=1e-3,
+                device="cuda", save_path="./model/best_model_stft_resnet.pth"):
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
@@ -113,39 +130,38 @@ def Train_model(model, train_loader, val_loader, num_epochs=10, lr=1e-3, device=
     best_val_acc = 0.0
 
     for epoch in range(num_epochs):
-        # Train 모드 진입
         model.train()
-        total_loss, correct, total = 0, 0, 0
-        for X, y in train_loader: # dataloader가 batch 단위로 학습 데이터를 던져주는거임~
-            X, y = X.to(device), y.to(device) # 그리고 gpu로 데이터들을 이동시켜
-            optimizer.zero_grad() # 이전 batch에서 쌓인 gradient 처음에 초기화 시켜주고
-            outputs = model(X) # CNN forward 연산을 해 -> 그럼 예측 결과가 나와
-            loss = criterion(outputs, y) # 예측 결과와 실제 정답을 비교해서 손실값 계산해
-            loss.backward() # 손실에 대한 gradient를 계산해
-            optimizer.step() # 계산된 gradient로 파라미터를 업데이트 해
+        total_loss, correct, total = 0.0, 0, 0
+        for X, y in tqdm(train_loader, desc=f"train {epoch+1}/{num_epochs}"):
+            X, y = X.to(device), y.to(device)
+            optimizer.zero_grad()
+            outputs = model(X)
+            loss = criterion(outputs, y)
+            loss.backward()
+            optimizer.step()
 
-            total_loss += loss.item()
-            _, predicted = torch.max(outputs, 1) # 예측된 클래스를 가장 큰 값의 index로 넣는다..
-            correct += (predicted == y).sum().item()
+            _, pred = torch.max(outputs, 1)
+            correct += (pred == y).sum().item()
             total += y.size(0)
+            total_loss += loss.item() * y.size(0)
 
         train_acc = correct / total
 
-        # Validation
+        # val
         model.eval()
-        val_correct, val_total = 0, 0
+        v_correct, v_total = 0, 0
         with torch.no_grad():
-            for X, y in val_loader:
+            for X, y in tqdm(val_loader, desc="val"):
                 X, y = X.to(device), y.to(device)
                 outputs = model(X)
-                _, predicted = torch.max(outputs, 1)
-                val_correct += (predicted == y).sum().item()
-                val_total += y.size(0)
-        val_acc = val_correct / val_total
+                _, pred = torch.max(outputs, 1)
+                v_correct += (pred == y).sum().item()
+                v_total += y.size(0)
+        val_acc = v_correct / v_total
+        avg_loss = total_loss / total
 
-        print(f"Epoch {epoch+1}/{num_epochs}, Loss: {total_loss:.4f}, Train Acc: {train_acc:.4f}, Val Acc: {val_acc:.4f}")
+        print(f"Epoch {epoch+1}/{num_epochs} | Loss {avg_loss:.4f} | Train {train_acc:.4f} | Val {val_acc:.4f}")
 
-        # best.pt 저장
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
@@ -154,53 +170,67 @@ def Train_model(model, train_loader, val_loader, num_epochs=10, lr=1e-3, device=
 
     return model
 
-# 평가 함수
 def evaluate_model(model, test_loader, device="cuda", class_names=None):
     model.to(device)
     model.eval()
     all_preds, all_labels = [], []
 
+    correct, total = 0, 0
     with torch.no_grad():
-        for X, y in test_loader:
+        for X, y in tqdm(test_loader, desc="test"):
             X, y = X.to(device), y.to(device)
             outputs = model(X)
-            _, predicted = torch.max(outputs, 1)
-            all_preds.extend(predicted.cpu().numpy())
-            all_labels.extend(y.cpu().numpy())
+            _, pred = torch.max(outputs, 1)
+            all_preds.extend(pred.detach().cpu().numpy())
+            all_labels.extend(y.detach().cpu().numpy())
+            correct += (pred == y).sum().item()
+            total   += y.size(0)
+            
+    all_preds = np.asarray(all_preds)
+    all_labels = np.asarray(all_labels)
+    accuracy = correct / total
 
-    all_preds = np.array(all_preds)
-    all_labels = np.array(all_labels)
-
-    # Accuracy, Precision, Recall, F1
+    print(f"Accuracy : {accuracy}")
     print("Classification Report:")
     print(classification_report(all_labels, all_preds, target_names=class_names, digits=4))
-
-    # Confusion Matrix
     print("Confusion Matrix:")
     print(confusion_matrix(all_labels, all_preds))
-            
 
 
-# 메인 루프
+# Main
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", type=str, choices=["train", "test"], required=True, help="학습 모드일 땐 train, 평가 모드일 땐 test")
-    parser.add_argument("--dataset", type=str, help="dataset path", default=r"E:\03_datasets\datasets_aihub_actor")
-    parser.add_argument("--checkpoint", type=str, default="./model/best_model_stft_resnet.pth", help="저장된 모델 불러오기 (경로 적기)")
-    parser.add_argument("--epochs", type=int, default=10, help="학습 epoch 수")
-    parser.add_argument("--batch_size", type=int, default=32)
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--mode", type=str, choices=["train", "test"], required=True)
+    ap.add_argument("--split_dir", type=str, default="./dataset_split", help="train/val/test CSV 위치")
+    ap.add_argument("--checkpoint", type=str, default="./model/best_model_stft_resnet.pth")
+    ap.add_argument("--epochs", type=int, default=5)
+    ap.add_argument("--batch_size", type=int, default=64)
+    ap.add_argument("--gpu", type=int, default=3)
 
-    root_dir = args.dataset
-    class_names = sorted(os.listdir(args.dataset))
+    # STFT params
+    ap.add_argument("--sr", type=int, default=16000)
+    ap.add_argument("--duration", type=int, default=3)
+    ap.add_argument("--n_fft", type=int, default=512)
+    ap.add_argument("--hop_length", type=int, default=160)
+    ap.add_argument("--win_length", type=int, default=400)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    train_loader, val_loader, test_loader = prepare_dataloaders(args.dataset, batch_size=args.batch_size)
-    model = EmotionRESNET(num_classes=len(class_names))
+    args = ap.parse_args()
+    device = f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu"
+
+    train_loader, val_loader, test_loader, num_classes, class_names = prepare_dataloaders_from_csv(
+        split_dir=args.split_dir,
+        batch_size=args.batch_size,
+        sr=args.sr, duration=args.duration,
+        n_fft=args.n_fft, hop_length=args.hop_length, win_length=args.win_length
+    )
+
+    model = EmotionRESNET(num_classes=num_classes)
 
     if args.mode == "train":
-        model = Train_model(model, train_loader, val_loader, num_epochs=args.epochs, device=device, save_path=args.checkpoint)
+        Train_model(model, train_loader, val_loader, num_epochs=args.epochs,
+                    device=device, save_path=args.checkpoint)
 
-    elif args.mode == "test":
-        model.load_state_dict(torch.load(args.checkpoint, map_location=device))
+    else:
+        state = torch.load(args.checkpoint, map_location=device)
+        model.load_state_dict(state)
         evaluate_model(model, test_loader, device=device, class_names=class_names)
